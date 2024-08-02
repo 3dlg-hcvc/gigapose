@@ -1,5 +1,5 @@
 root_dir: ${machine.root_dir}/datasets/
-source_url: https://bop.felk.cvut.cz/media/data/bop_datasets/
+source_url: https://huggingface.co/datasets/bop-benchmark/datasets/resolve/main
 source_cnos_url: https://bop.felk.cvut.cz/media/data/bop_datasets_extra/bop23_default_detections_for_task4.zip
 unzip_mode: unzip
 
