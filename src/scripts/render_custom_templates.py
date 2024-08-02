@@ -65,6 +65,7 @@ def render(cfg) -> None:
 
     OmegaConf.set_struct(cfg, False)
     root_dir = Path(cfg.data.test.root_dir)
+    root_dir = os.getcwd() / root_dir
     root_save_dir = root_dir / "templates"
     template_poses = get_obj_poses_from_template_level(level=1, pose_distribution="all")
     template_poses[:, :3, 3] *= 0.4  # zoom to object
