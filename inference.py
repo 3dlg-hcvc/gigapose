@@ -10,11 +10,9 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 from einops import repeat
 import pytorch_lightning as pl
-from src.utils.logging import get_logger, log_image
 from src.utils.batch import BatchedData, gather
 from src.utils.optimizer import HybridOptim
 from torchvision.utils import save_image
-from src.utils.time import Timer
 from src.models.loss import cosine_similarity
 from src.lib3d.torch import (
     cosSin,
@@ -29,11 +27,145 @@ from src.libVis.torch import (
 from src.models.poses import ObjectPoseRecovery
 import src.megapose.utils.tensor_collection as tc
 from src.utils.inout import save_predictions_from_batched_predictions
+from src.utils.pil import open_image
 
-from src.custom_megapose.template_dataset import TemplateDataset, NearestTemplateFinder
-import torch
+from src.custom_megapose.template_dataset import NearestTemplateFinder
+from src.custom_megapose.transform import Transform, ScaleTransform
 
-logger = get_logger(__name__)
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Union
+
+import hydra
+from omegaconf import DictConfig, OmegaConf
+from hydra.utils import instantiate
+from torch.utils.data import DataLoader
+from src.utils.logging import start_disable_output, stop_disable_output
+
+
+@dataclass
+class TemplateData:
+    label: str
+    template_dir: str
+    num_templates: int
+    TWO_init: Transform
+    pose_path: Optional[str] = None
+
+    @staticmethod
+    def from_dict(template_gt) -> "TemplateData":
+        assert isinstance(template_gt, dict)
+        data = TemplateData(
+            label=template_gt["label"],
+            template_dir=str(template_gt["template_dir"]),
+            pose_path=str(template_gt["pose_path"]),
+            num_templates=int(template_gt["num_templates"]),
+            TWO_init=ScaleTransform(scale_factor=template_gt["scale_factor"]),
+        )
+        return data
+
+    def load_template(self, view_id, inplane=None):
+        image_path = f"{self.template_dir}/{view_id}.png"
+        rgba = open_image(image_path, inplane)
+        box = rgba.getbbox()
+        box_size = (box[2] - box[0], box[3] - box[1])
+        if min(box_size) == 0:
+            box = (0, 0, int(rgba.size[0]), int(rgba.size[1]))
+            print(f"Template {image_path} has zero area, setting to null template")
+        return {"rgba": np.array(rgba), "box": np.array(box)}
+
+    def load_set_of_templates(self, view_ids, reload=False, inplanes=None, reset=True):
+        if inplanes is None:
+            inplanes = [None for _ in view_ids]
+        root_dir = os.path.dirname(self.template_dir)
+        obj_id = os.path.basename(self.template_dir)
+
+        preprocessed_file = f"{root_dir}/preprocessed/{int(obj_id):06d}.npz"
+        if os.path.exists(preprocessed_file) and reload and not reset:
+            data = np.load(preprocessed_file)
+            rgba = torch.from_numpy(data["rgba"]).float()
+            box = torch.from_numpy(data["box"]).long()
+            return {"rgba": rgba, "box": box}
+        else:
+            os.makedirs(f"{root_dir}/preprocessed", exist_ok=True)
+            data = {"rgba": [], "box": []}
+            for view_id, inplane in zip(view_ids, inplanes):
+                view_data = self.load_template(view_id, inplane=inplane)
+                rgba = torch.from_numpy(view_data["rgba"] / 255).float()
+                box = torch.from_numpy(view_data["box"]).long()
+                data["rgba"].append(rgba)
+                data["box"].append(box)
+            data["rgba"] = torch.stack(data["rgba"]).permute(0, 3, 1, 2)
+            data["box"] = torch.stack(data["box"])
+            if reload:
+                np.savez(
+                    preprocessed_file,
+                    rgba=data["rgba"].numpy(),
+                    box=data["box"].numpy(),
+                )
+        return data
+
+    def apply_transform(self, transform, data):
+        data["rgba"], data["M"] = transform(
+            images=data["rgba"], boxes=data["box"], return_transform=True
+        )
+        return data
+
+    def load_pose(self, view_ids=None, inplanes=[0]):
+        poses = np.load(self.pose_path)
+        if view_ids is None:  # all poses for testing mode
+            poses = [Transform(poses[i]) * self.TWO_init for i in range(len(poses))]
+            return torch.stack([pose.toTensor() for pose in poses])
+        else:  # only load poses for training mode
+            inplane_transforms = [Transform.from_inplane(inp) for inp in inplanes]
+            poses = [
+                inplane_transforms[i] * Transform(poses[view_ids[i]]) * self.TWO_init
+                for i in range(len(view_ids))
+            ]
+            return poses
+
+    def read_test_mode(self):
+        data = self.load_set_of_templates(view_ids=np.arange(0, self.num_templates))
+        poses = self.load_pose()
+        return data, poses
+
+
+@dataclass
+class TemplateDataset:
+    def __init__(
+        self,
+        object_templates: List[TemplateData],
+    ):
+        self.list_object_templates = object_templates
+        self.label_to_objects = {obj.label: obj for obj in object_templates}
+        self.K = np.array(
+            [193.9897, 0.0, 112, 0.0, 193.9897, 112, 0.0, 0.0, 1.0]
+        ).reshape((3, 3))
+
+    def __getitem__(self, idx: int) -> TemplateData:
+        return self.list_object_templates[idx]
+
+    def get_object_templates(self, label: str) -> TemplateData:
+        return self.label_to_objects[label]
+
+    def __len__(self) -> int:
+        return len(self.list_object_templates)
+
+    @property
+    def objects(self) -> List[TemplateData]:
+        """Returns a list of objects in this dataset."""
+        return self.list_object_templates
+
+    def from_config(model_infos) -> "TemplateDataset":
+        template_datas = []
+        for model_info in tqdm(model_infos):
+            obj_id = model_info["obj_id"]
+            template_metaData = {"label": str(obj_id)}
+            template_metaData["num_templates"] = 24
+            template_metaData["template_dir"] = f"/local-scratch/qiruiw/research/diorama/data/wss-neutral-renders/{obj_id}"
+            template_metaData["pose_path"] = "/local-scratch/qiruiw/research/diorama/data/obj_poses.npy"
+            template_metaData["scale_factor"] = 1
+            template_data = TemplateData.from_dict(template_metaData)
+            template_datas.append(template_data)
+        return TemplateDataset(template_datas)
 
 
 class TemplateSet(Dataset):
@@ -50,26 +182,18 @@ class TemplateSet(Dataset):
         self.transforms = transforms
 
         # load the template dataset
-        self.model_infos = [{"obj_id": obj_id.strip()} for obj_id in open("/local-scratch/qiruiw/research/diorama/data/wss/wss_models.txt")]
+        self.model_infos = [{"obj_id": obj_id.strip()} for obj_id in open("/project/3dlg-hcvc/diorama/wss/wss_models.txt")]
 
         template_config.dir += f"/{dataset_name}"
-        self.template_dataset = TemplateDataset.from_config(
-            self.model_infos, template_config
-        )
+        self.template_dataset = TemplateDataset.from_config(self.model_infos)
         self.template_finder = NearestTemplateFinder(template_config)
 
     def __len__(self):
         return len(self.model_infos)
 
     def __getitem__(self, index):
-        # loading templates
-        if "lmo" in self.dataset_name:
-            label = LMO_index_to_ID[index]
-        else:
-            label = f"{index+1}"
-
         # load template data
-        template_data = self.template_dataset.get_object_templates(label)
+        template_data = self.template_dataset.get_object_templates(self.model_infos[index]["obj_id"])
         data, poses = template_data.read_test_mode()
 
         # crop the template
@@ -96,10 +220,7 @@ class GigaPose(pl.LightningModule):
         model_name,
         ae_net,
         ist_net,
-        training_loss,
         testing_metric,
-        optim_config,
-        log_interval,
         log_dir,
         max_num_dets_per_forward=None,
         **kwargs,
@@ -109,7 +230,6 @@ class GigaPose(pl.LightningModule):
         self.model_name = model_name
         self.ae_net = ae_net
         self.ist_net = ist_net
-        # self.training_loss = training_loss
         self.testing_metric = testing_metric
 
         self.max_num_dets_per_forward = max_num_dets_per_forward
@@ -124,8 +244,6 @@ class GigaPose(pl.LightningModule):
         self.run_id = None
         self.template_datasets = None
         self.test_dataset_name = None
-
-        logger.info("Initialize GigaPose done!")
 
     def validate_contrast_loss(self, batch, idx_batch, split):
         src_feat = self.ae_net(batch.src_img)
@@ -143,8 +261,7 @@ class GigaPose(pl.LightningModule):
     def validation_step(self, batch, idx_batch):
         _ = self.validate_contrast_loss(batch, idx_batch, "val")
 
-    def set_template_data(self, dataset_name):
-        logger.info("Initializing template data ...")
+    def encode_multiviews(self, dataset_name):
         template_dataset = self.template_datasets[dataset_name]
         names = ["rgb", "mask", "K", "M", "poses", "ae_features", "ist_features"]
         template_data = {name: BatchedData(None) for name in names}
@@ -192,11 +309,10 @@ class GigaPose(pl.LightningModule):
         torch.cuda.empty_cache()
         # prepare template data
         if dataset_name not in self.template_datas:
-            self.set_template_data(dataset_name)
+            self.encode_multiviews(dataset_name)
 
         template_data = self.template_datas[dataset_name]
         pose_recovery = self.pose_recovery[dataset_name]
-        times = {"neighbor_search": None, "final_step": None}
 
         B, C, H, W = batch.tar_img.shape
         device = batch.tar_img.device
@@ -256,3 +372,48 @@ class GigaPose(pl.LightningModule):
             dataset_name=self.test_dataset_name,
         )
         return 0
+
+
+
+@hydra.main(version_base=None, config_path="configs", config_name="test")
+def run_test(cfg: DictConfig):
+    OmegaConf.set_struct(cfg, False)
+    # cfg_trainer = cfg.machine.trainer
+    os.makedirs(cfg.save_dir, exist_ok=True)
+
+    # trainer = instantiate(cfg_trainer)
+    cfg.model._target_ = "__main__.GigaPose"
+    model = instantiate(cfg.model)
+
+    # cfg.data.test.dataloader.dataset_name = cfg.test_dataset_name
+    # cfg.data.test.dataloader.batch_size = cfg.machine.batch_size
+    # cfg.data.test.dataloader.load_gt = False
+    # test_dataset = instantiate(cfg.data.test.dataloader)
+    # test_dataloader = DataLoader(
+    #     test_dataset.web_dataloader.datapipeline,
+    #     batch_size=1,  # a single image may have multiples instances
+    #     num_workers=cfg.machine.num_workers,
+    #     collate_fn=test_dataset.collate_fn,
+    # )
+
+    # set template dataset as a part of the model
+    cfg.data.test.dataloader.dataset_name = cfg.test_dataset_name
+    cfg.data.test.dataloader._target_ = "__main__.TemplateSet"
+    template_dataset = instantiate(cfg.data.test.dataloader)
+    import pdb; pdb.set_trace()
+
+    model.template_datasets = {cfg.test_dataset_name: template_dataset}
+    model.test_dataset_name = cfg.test_dataset_name
+    model.max_num_dets_per_forward = cfg.max_num_dets_per_forward
+    
+    model.encode_multiviews(cfg.test_dataset_name)
+
+    # model.log_interval = len(test_dataloader) // 30
+
+    # trainer.test(
+    #     model, dataloaders=test_dataloader, ckpt_path=cfg.model.checkpoint_path
+    # )
+
+
+if __name__ == "__main__":
+    run_test()
