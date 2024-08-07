@@ -384,6 +384,9 @@ def run_test(cfg: DictConfig):
     # trainer = instantiate(cfg_trainer)
     cfg.model._target_ = "__main__.GigaPose"
     model = instantiate(cfg.model)
+    ckpt = torch.load(cfg.model.checkpoint_path)
+    model.load_state_dict(ckpt["state_dict"])
+    model.eval()
 
     # cfg.data.test.dataloader.dataset_name = cfg.test_dataset_name
     # cfg.data.test.dataloader.batch_size = cfg.machine.batch_size
@@ -400,11 +403,11 @@ def run_test(cfg: DictConfig):
     cfg.data.test.dataloader.dataset_name = cfg.test_dataset_name
     cfg.data.test.dataloader._target_ = "__main__.TemplateSet"
     template_dataset = instantiate(cfg.data.test.dataloader)
-    import pdb; pdb.set_trace()
 
     model.template_datasets = {cfg.test_dataset_name: template_dataset}
     model.test_dataset_name = cfg.test_dataset_name
     model.max_num_dets_per_forward = cfg.max_num_dets_per_forward
+    # import pdb; pdb.set_trace()
     
     model.encode_multiviews(cfg.test_dataset_name)
 
