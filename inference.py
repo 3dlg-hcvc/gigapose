@@ -8,12 +8,12 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset
-from einops import repeat
+# from einops import repeat
 import pytorch_lightning as pl
 from src.utils.batch import BatchedData, gather
-from src.utils.optimizer import HybridOptim
+# from src.utils.optimizer import HybridOptim
 from torchvision.utils import save_image
-from src.models.loss import cosine_similarity
+# from src.models.loss import cosine_similarity
 from src.lib3d.torch import (
     cosSin,
     get_relative_scale_inplane,
@@ -39,7 +39,7 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 from hydra.utils import instantiate
 from torch.utils.data import DataLoader
-from src.utils.logging import start_disable_output, stop_disable_output
+# from src.utils.logging import start_disable_output, stop_disable_output
 
 
 @dataclass
@@ -75,17 +75,17 @@ class TemplateData:
     def load_set_of_templates(self, view_ids, reload=False, inplanes=None, reset=True):
         if inplanes is None:
             inplanes = [None for _ in view_ids]
-        root_dir = os.path.dirname(self.template_dir)
+        root_dir = os.path.dirname(self.template_dir) + "-preprocessed"
         obj_id = os.path.basename(self.template_dir)
 
-        preprocessed_file = f"{root_dir}/preprocessed/{int(obj_id):06d}.npz"
+        preprocessed_file = f"{root_dir}/{obj_id}.npz"
         if os.path.exists(preprocessed_file) and reload and not reset:
             data = np.load(preprocessed_file)
             rgba = torch.from_numpy(data["rgba"]).float()
             box = torch.from_numpy(data["box"]).long()
             return {"rgba": rgba, "box": box}
         else:
-            os.makedirs(f"{root_dir}/preprocessed", exist_ok=True)
+            os.makedirs(root_dir, exist_ok=True)
             data = {"rgba": [], "box": []}
             for view_id, inplane in zip(view_ids, inplanes):
                 view_data = self.load_template(view_id, inplane=inplane)
@@ -161,7 +161,7 @@ class TemplateDataset:
             template_metaData = {"label": str(obj_id)}
             template_metaData["num_templates"] = 24
             template_metaData["template_dir"] = f"/local-scratch/qiruiw/research/diorama/data/wss-neutral-renders/{obj_id}"
-            template_metaData["pose_path"] = "/local-scratch/qiruiw/research/diorama/data/obj_poses.npy"
+            template_metaData["pose_path"] = "/local-scratch/qiruiw/research/diorama/data/obj_poses_24.npy"
             template_metaData["scale_factor"] = 1
             template_data = TemplateData.from_dict(template_metaData)
             template_datas.append(template_data)
@@ -231,6 +231,7 @@ class GigaPose(pl.LightningModule):
         self.ae_net = ae_net
         self.ist_net = ist_net
         self.testing_metric = testing_metric
+        # self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.max_num_dets_per_forward = max_num_dets_per_forward
 
@@ -271,11 +272,12 @@ class GigaPose(pl.LightningModule):
                 if name in ["ae_features", "ist_features"]:
                     continue
                 if name == "rgb":
+                    torch.cuda.empty_cache()
                     templates = template_dataset[idx].rgb.to(self.device)
                     if self.max_num_dets_per_forward is None:
                         template_data[name].append(templates)
-
                     ae_features = self.ae_net(templates)
+                    # import pdb; pdb.set_trace()
                     template_data["ae_features"].append(ae_features)
 
                     ist_features = self.ist_net.forward_by_chunk(templates)
@@ -353,16 +355,135 @@ class GigaPose(pl.LightningModule):
                 predictions = predictions_
             else:
                 predictions.cat_df(predictions_)
+        
+        # Step 2: Find affine transforms
+        num_patches = predictions.src_pts.shape[2]
+        k = self.testing_metric.k
+        pred_scales = torch.zeros(B, k, num_patches, device=device)
+        pred_cosSin_inplanes = torch.zeros(B, k, num_patches, 2, device=device)
 
-        # # calculate prediction
-        # pred_poses = self.pose_recovery[dataset_name].forward_recovery(
-        #     tar_label=tar_label,
-        #     tar_K=batch.tar_K,
-        #     tar_M=batch.tar_M,
-        #     pred_src_views=predictions.id_src,
-        #     pred_M=predictions.M.clone(),
-        # )
-        # predictions.register_tensor("pred_poses", pred_poses)
+        # self.timer.tic()
+        for idx_k in range(k):
+            idx_sample = torch.arange(0, B, device=device)
+            idx_views = [idx_sample, predictions.id_src[:, idx_k]]
+
+            tar_label_np = np.asarray(batch.infos.label).astype(np.int32)
+            tar_label = torch.from_numpy(tar_label_np).to(device)
+
+            src_ist_features = template_data.ist_features[tar_label - 1]
+            tar_ist_features = self.ist_net.forward_by_chunk(batch.tar_img[idx_sample])
+
+            if self.max_num_dets_per_forward is not None:
+                (
+                    pred_scales[:, idx_k],
+                    pred_cosSin_inplanes[:, idx_k],
+                ) = self.ist_net.inference_by_chunk(
+                    src_feat=src_ist_features[idx_views],
+                    tar_feat=tar_ist_features,
+                    src_pts=predictions.src_pts[:, idx_k],
+                    tar_pts=predictions.tar_pts[:, idx_k],
+                    max_batch_size=self.max_num_dets_per_forward,
+                )
+            else:
+                (
+                    pred_scales[:, idx_k],
+                    pred_cosSin_inplanes[:, idx_k],
+                ) = self.ist_net.inference(
+                    src_feat=src_ist_features[idx_views],
+                    tar_feat=tar_ist_features,
+                    src_pts=predictions.src_pts[:, idx_k],
+                    tar_pts=predictions.tar_pts[:, idx_k],
+                )
+
+        predictions.register_tensor("relScale", pred_scales)
+        predictions.register_tensor(
+            "relInplane",
+            pred_cosSin_inplanes,
+        )
+        # times["neighbor_search"] = self.timer.toc()
+        # self.timer.reset()
+
+        # self.timer.tic()
+        predictions = pose_recovery.forward_ransac(predictions=predictions)
+        # sort the predictions by the number of inliers for each detection
+        score = torch.sum(predictions.ransac_scores, dim=2) / num_patches
+        predictions.register_tensor("scores", score)
+        if sort_pred_by_inliers:
+            order = torch.argsort(score, dim=1, descending=True)
+            for k, v in predictions._tensors.items():
+                if k in ["infos", "meta"]:
+                    continue
+                predictions.register_tensor(k, v[idx_sample[:, None], order])
+
+        # calculate prediction
+        pred_poses = pose_recovery.forward_recovery(
+            tar_label=tar_label,
+            tar_K=batch.tar_K,
+            tar_M=batch.tar_M,
+            pred_src_views=predictions.id_src,
+            pred_M=predictions.M.clone(),
+        )
+        predictions.register_tensor("pred_poses", pred_poses)
+
+        # times["final_step"] = self.timer.toc()
+        # self.timer.reset()
+        total_time = 0 # sum(times.values())
+        
+        save_path = osp.join(self.log_dir, "predictions", f"{idx_batch}.npz")
+        selected_idxs, predictions = self.filter_and_save(
+            predictions, test_list=batch.test_list, time=total_time, save_path=save_path
+        )
+    
+    def filter_and_save(
+        self,
+        predictions,
+        test_list,
+        time,
+        save_path,
+        keep_only_testing_instances=True,
+    ):
+        labels = np.asarray(predictions.infos.label).astype(np.int32)
+        assert len(np.unique(labels)) == len(np.unique(test_list.infos.obj_id))
+        detection_times = []
+        if keep_only_testing_instances:
+            selected_idxs = []
+            for idx, id in enumerate(test_list.infos.obj_id):
+                num_inst = test_list.infos.inst_count[idx]
+                idx_inst = labels == id
+                pred_inst = predictions[idx_inst.tolist()]
+
+                selected_idx = torch.argsort(pred_inst.scores[:, 0], descending=True)
+                selected_idx = selected_idx[:num_inst].cpu().numpy()
+                selected_idx = np.arange(len(labels))[idx_inst][selected_idx]
+                selected_idxs.extend(selected_idx.tolist())
+                detection_times.extend(
+                    [test_list.infos.detection_time[idx] for _ in range(num_inst)]
+                )
+        predictions = predictions[selected_idxs]
+
+        detection_times = np.array(detection_times)
+        detection_times = torch.from_numpy(detection_times).to(
+            predictions.scores.device
+        )
+        time = torch.ones_like(detection_times) * time
+        predictions.register_tensor("detection_time", detection_times)
+        predictions.register_tensor("time", time)
+
+        scene_id = np.asarray(predictions.infos.scene_id).astype(np.int32)
+        im_id = np.asarray(predictions.infos.view_id).astype(np.int32)
+        label = np.asarray(predictions.infos.label).astype(np.int32)
+
+        np.savez(
+            save_path,
+            scene_id=scene_id,
+            im_id=im_id,
+            object_id=label,
+            time=predictions.time.cpu().numpy(),
+            detection_time=predictions.detection_time.cpu().numpy(),
+            poses=predictions.pred_poses.cpu().numpy(),
+            scores=predictions.scores.cpu().numpy(),
+        )
+        return selected_idxs, predictions
 
     @torch.no_grad()
     def test_step(self, batch, idx_batch):
@@ -375,7 +496,7 @@ class GigaPose(pl.LightningModule):
 
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="test")
+@hydra.main(version_base=None, config_path="configs", config_name="test_wss")
 def run_test(cfg: DictConfig):
     OmegaConf.set_struct(cfg, False)
     # cfg_trainer = cfg.machine.trainer
@@ -386,6 +507,7 @@ def run_test(cfg: DictConfig):
     model = instantiate(cfg.model)
     ckpt = torch.load(cfg.model.checkpoint_path)
     model.load_state_dict(ckpt["state_dict"])
+    model = model.cuda()
     model.eval()
 
     # cfg.data.test.dataloader.dataset_name = cfg.test_dataset_name
@@ -400,14 +522,14 @@ def run_test(cfg: DictConfig):
     # )
 
     # set template dataset as a part of the model
-    cfg.data.test.dataloader.dataset_name = cfg.test_dataset_name
-    cfg.data.test.dataloader._target_ = "__main__.TemplateSet"
+    # cfg.data.test.dataloader.dataset_name = cfg.test_dataset_name
+    # cfg.data.test.dataloader._target_ = "__main__.TemplateSet"
     template_dataset = instantiate(cfg.data.test.dataloader)
+    # import pdb; pdb.set_trace()
 
     model.template_datasets = {cfg.test_dataset_name: template_dataset}
     model.test_dataset_name = cfg.test_dataset_name
     model.max_num_dets_per_forward = cfg.max_num_dets_per_forward
-    # import pdb; pdb.set_trace()
     
     model.encode_multiviews(cfg.test_dataset_name)
 
