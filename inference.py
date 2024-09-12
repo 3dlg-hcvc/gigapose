@@ -453,6 +453,49 @@ class GigaPose(pl.LightningModule):
         # selected_idxs, predictions = self.filter_and_save(
         #     predictions, test_list=test_list, time=total_time, save_path=save_path
         # )
+
+        # import pdb; pdb.set_trace()
+        vis_img = self.vis_retrieval(
+            tar_img=tar_img,
+            tar_mask=tar_mask,
+            src_img=template_data["rgb"],
+            src_mask=template_data["mask"],
+            template_data=template_data,
+            # batch=batch,
+            predictions=predictions,
+        )
+        sample_path = f"{self.log_dir}/pose_sample.png"
+        save_image(
+            vis_img,
+            sample_path,
+            nrow=predictions.id_src.shape[0],
+        )
+    
+    def vis_retrieval(self, tar_img, tar_mask, src_img, src_mask, template_data, predictions):
+        # device = template_data.rgb.device
+        # idx_sample = torch.arange(0, predictions.id_src.shape[0], device=device)
+        # tar_label_np = np.asarray(predictions.infos.label).astype(np.int32)
+        # tar_label = torch.from_numpy(tar_label_np).to(device)
+
+        # src_imgs = template_data.rgb[tar_label - 1]
+        # src_masks = template_data.mask[tar_label - 1]
+        pred_imgs = []
+        for idx_k in range(self.testing_metric.k):
+            batch = tc.PandasTensorCollection(
+                infos=pd.DataFrame(),
+                src_img=src_img[predictions.id_src[:, idx_k]].clone(),
+                src_mask=src_mask[predictions.id_src[:, idx_k]].clone(),
+                tar_img=tar_img,
+                tar_mask=tar_mask,
+                src_pts=predictions.ransac_src_pts[:, idx_k],
+                tar_pts=predictions.ransac_tar_pts[:, idx_k],
+            )
+            keypoint_img = plot_keypoints_batch(batch, concate_input_in_pred=False)
+            wrap_img = plot_Kabsch(batch, predictions.M[:, idx_k])
+            pred_img = torch.cat([keypoint_img, wrap_img], dim=3)
+            pred_imgs.append(pred_img)
+        pred_imgs = torch.cat(pred_imgs, dim=0)
+        return pred_imgs
     
     def filter_and_save(
         self,
