@@ -12,9 +12,9 @@ save_dir: ${machine.root_dir}/results/${name_exp}
 name_exp:  ${model.model_name}_${run_id}
 test_dataset_name: wss
 
-run_id: 
+run_id: wss
 disable_output: false
 
 # for refinement
 use_multiple: true
-max_num_dets_per_forward: None # set None to disable, 2 is the minimum when enabled
+max_num_dets_per_forward: # set None to disable, 2 is the minimum when enabled
