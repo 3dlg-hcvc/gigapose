@@ -32,16 +32,16 @@ def download(cfg: DictConfig) -> None:
 
     OmegaConf.set_struct(cfg, False)
     for dataset_name in [
-        "gso",
-        "shapenet",
+        "GSO",
+        "ShapeNetCore",
     ]:
         logger.info(f"Downloading {dataset_name}")
-        url = f"{cfg_data.source_url}/bop23_datasets/megapose-{dataset_name}/train_pbr_web/"
+        url = f"{cfg_data.source_url}/MegaPose-{dataset_name}/"
         cfg_dataset = OmegaConf.create(
             {
                 "name": dataset_name,
                 "url": url,
-                "local_dir": cfg_data.root_dir / dataset_name,
+                "local_dir": cfg_data.root_dir / dataset_name.lower(),
                 "tmp": tmp_dir,
             }
         )

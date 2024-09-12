@@ -30,24 +30,24 @@ def download(cfg: DictConfig) -> None:
 
     OmegaConf.set_struct(cfg, False)
     for dataset_name in [
-        "gso",
-        "shapenet",
+        "GSO",
+        "ShapeNetCore",
     ]:
         logger.info(f"Downloading {dataset_name}")
-        models_info_url = f"{cfg_data.source_url}/bop23_datasets/megapose-{dataset_name}/{dataset_name}_models.json"
+        models_info_url = f"{cfg_data.source_url}/MegaPose-{dataset_name}/{dataset_name.lower()}_models.json"
         models_info_path = (
-            cfg_data.root_dir / dataset_name / "models_info.json"
+            cfg_data.root_dir / dataset_name.lower() / "models_info.json"
         )
-        key_to_shard_url = f"{cfg_data.source_url}/bop23_datasets/megapose-{dataset_name}/train_pbr_web/key_to_shard.json"
+        key_to_shard_url = f"{cfg_data.source_url}/MegaPose-{dataset_name}/key_to_shard.json"
         key_to_shard_path = (
-            cfg_data.root_dir / dataset_name / "key_to_shard.json"
+            cfg_data.root_dir / dataset_name.lower() / "key_to_shard.json"
         )
         cfg_dataset = OmegaConf.create(
             {
                 "name": dataset_name,
                 "models_info_url": models_info_url,
                 "key_to_shard_url": key_to_shard_url,
-                "local_dir": cfg_data.root_dir / dataset_name,
+                "local_dir": cfg_data.root_dir / dataset_name.lower(),
                 "models_info_path": models_info_path,
                 "key_to_shard_path": key_to_shard_path,
             }
