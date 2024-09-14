@@ -2,45 +2,33 @@ import os
 import os.path as osp
 from pathlib import Path
 from tqdm import tqdm
+import hydra
+from hydra.utils import instantiate
+from omegaconf import DictConfig, OmegaConf
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Union
 import pandas as pd
 import numpy as np
 import torch
-from torch import nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset
-# from einops import repeat
-import pytorch_lightning as pl
-from src.utils.batch import BatchedData, gather
-# from src.utils.optimizer import HybridOptim
+from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import Normalize, ToTensor
 from torchvision.utils import save_image
+# from einops import repeat
+import pytorch_lightning as pl
+
+# from src.utils.batch import BatchedData, gather
+# from src.utils.optimizer import HybridOptim
 # from src.models.loss import cosine_similarity
-from src.lib3d.torch import (
-    cosSin,
-    get_relative_scale_inplane,
-    geodesic_distance,
-)
 from src.libVis.torch import (
     plot_Kabsch,
     plot_keypoints_batch,
-    save_tensor_to_image,
+    # save_tensor_to_image,
 )
 from src.models.poses import ObjectPoseRecovery
 import src.megapose.utils.tensor_collection as tc
-from src.utils.inout import save_predictions_from_batched_predictions
-from src.utils.pil import open_image
-
-from src.custom_megapose.template_dataset import NearestTemplateFinder
 from src.custom_megapose.transform import Transform, ScaleTransform
-
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
-
-import hydra
-from omegaconf import DictConfig, OmegaConf
-from hydra.utils import instantiate
-from torch.utils.data import DataLoader
-# from src.utils.logging import start_disable_output, stop_disable_output
+# from src.utils.inout import save_predictions_from_batched_predictions
+from src.utils.pil import open_image
 
 
 @dataclass
@@ -187,7 +175,6 @@ class TemplateSet(Dataset):
 
         template_config.dir += f"/{dataset_name}"
         self.template_dataset = TemplateDataset.from_config(self.model_infos)
-        self.template_finder = NearestTemplateFinder(template_config)
 
     def __len__(self):
         return len(self.model_infos)

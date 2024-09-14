@@ -156,7 +156,7 @@ class LocalSimilarity(torch.nn.Module):
                 idx_tar2src=idx_tar2src,
             )
         else:
-            mask_cycle = torch.ones_like(t_mask)
+            mask_cycle = torch.ones_like(mask_sim)
 
         mask_tar2src = torch.gather(src_mask, 1, idx_tar2src)
         mask_non_zero = (
@@ -243,7 +243,7 @@ class LocalSimilarity(torch.nn.Module):
                 score_tar2src, idx_tar2src = torch.max(sim, dim=2)  # b x n x s
                 score_src2tar, idx_src2tar = torch.max(sim, dim=3)  # b x n x t
 
-            # Filter out the slow score matching
+            # Filter out the low score matching
             mask_sim = score_tar2src >= self.sim_threshold
 
             # Find consistency patches (source -> target -> source)
